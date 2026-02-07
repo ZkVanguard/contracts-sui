@@ -1,0 +1,4 @@
+build/
+.sui/
+.env
+*.log
