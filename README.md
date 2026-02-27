@@ -22,19 +22,19 @@ See deployment addresses in main repo.
 - Move Prover (optional)
 
 ### Build
-`ash
+```bash
 sui move build
-`
+```
 
 ### Test
-`ash
+```bash
 sui move test
-`
+```
 
 ### Deploy
-`ash
+```bash
 sui client publish --gas-budget 100000000
-`
+```
 
 ## License
 
