@@ -6,7 +6,43 @@ module zkvanguard::zk_verifier {
     use sui::table::{Self, Table};
     use sui::clock::{Self, Clock};
     use sui::hash;
+    use sui::ed25519;
+    use sui::dynamic_field as df;
     use std::string::String;
+
+    // ============ Audit 2026-06-04 — ed25519-based prover attestation ============
+    //
+    // The verify_proof / execute_commitment paths historically only checked
+    // proof byte length. To upgrade from theatre to real verification without
+    // breaking existing test deployments, an opt-in attestation model is added:
+    //
+    //   1. Admin calls admin_set_prover_pubkey(pubkey) with the 32-byte
+    //      ed25519 public key of the off-chain STARK prover.
+    //   2. From that point on, every verify call requires the proof bytes
+    //      to start with a 64-byte ed25519 signature over the expected
+    //      context (commitment_hash or commitment_hash || extra context).
+    //   3. Until a pubkey is set, the legacy length check is preserved so
+    //      existing flows keep working during migration — but operators
+    //      should treat unset-pubkey state as INSECURE and set the key
+    //      before relying on the ZK gate.
+    //
+    // Dynamic-field storage is used so the field can be added to already-
+    // deployed package state objects without a struct migration.
+    const PROVER_PUBKEY_KEY: vector<u8> = b"zkv_prover_pubkey_v1";
+
+    // ============ Quantum-safe strict mode (2026-07-29) ============
+    //
+    // The ed25519 attestation fast path is CLASSICALLY secure but
+    // QUANTUM-VULNERABLE — Shor's algorithm breaks EdDSA. The STARK path
+    // (`verify_hedge_stark_proof_entry`) is fully post-quantum (SHA-256
+    // collision resistance only, no DLP anywhere in the protocol).
+    //
+    // When `STARK_ONLY_MODE_KEY` is set to true, `verify_with_prover`
+    // returns false unconditionally — every verify MUST route through
+    // the STARK path. Admin flip via `admin_set_stark_only_mode` behind
+    // AdminCap. Dynamic-field storage so already-deployed state can
+    // opt in without a struct migration.
+    const STARK_ONLY_MODE_KEY: vector<u8> = b"zkv_stark_only_mode_v1";
 
     // ============ Error Codes ============
     const E_NOT_AUTHORIZED: u64 = 0;
@@ -168,6 +204,100 @@ module zkvanguard::zk_verifier {
         state.proof_expiry_ms = expiry_ms;
     }
 
+    /// Configure the off-chain prover's ed25519 public key.
+    ///
+    /// Must be exactly 32 bytes. Once set, all verify_proof /
+    /// verify_proof_for_portfolio / execute_commitment calls require a
+    /// real signature in the first 64 bytes of the proof data over the
+    /// commitment_hash (for verify_proof) or hash(proof_data) (for
+    /// execute_commitment). Pass an empty vector to clear (back to
+    /// insecure length-check mode — operator emergency only).
+    public entry fun admin_set_prover_pubkey(
+        _admin: &AdminCap,
+        state: &mut ZKVerifierState,
+        pubkey: vector<u8>,
+    ) {
+        let len = vector::length(&pubkey);
+        assert!(len == 32 || len == 0, E_INVALID_PROOF);
+        if (df::exists_(&state.id, PROVER_PUBKEY_KEY)) {
+            let _: vector<u8> = df::remove(&mut state.id, PROVER_PUBKEY_KEY);
+        };
+        if (len == 32) {
+            df::add(&mut state.id, PROVER_PUBKEY_KEY, pubkey);
+        };
+    }
+
+    /// Returns true if a prover pubkey is currently configured. Used by
+    /// off-chain ops to detect insecure mode.
+    public fun has_prover_pubkey(state: &ZKVerifierState): bool {
+        df::exists_(&state.id, PROVER_PUBKEY_KEY)
+    }
+
+    /// Enable / disable STARK-only strict mode. When enabled, the
+    /// ed25519 attestation fast path is disabled — every verify must
+    /// route through `verify_hedge_stark_proof_entry`. Post-quantum
+    /// deployments SHOULD enable this. Default (unset) = disabled
+    /// (accepts both paths, matches the pre-strict-mode behavior).
+    public entry fun admin_set_stark_only_mode(
+        _admin: &AdminCap,
+        state: &mut ZKVerifierState,
+        enabled: bool,
+    ) {
+        if (df::exists_(&state.id, STARK_ONLY_MODE_KEY)) {
+            let _: bool = df::remove(&mut state.id, STARK_ONLY_MODE_KEY);
+        };
+        if (enabled) {
+            df::add(&mut state.id, STARK_ONLY_MODE_KEY, true);
+        };
+    }
+
+    /// Read the strict-mode flag. Defaults to false when the dynamic
+    /// field hasn't been set (pre-strict-mode deployments).
+    public fun is_stark_only_mode(state: &ZKVerifierState): bool {
+        if (!df::exists_(&state.id, STARK_ONLY_MODE_KEY)) {
+            return false
+        };
+        *df::borrow(&state.id, STARK_ONLY_MODE_KEY)
+    }
+
+    /// Extract the first 64 bytes of a proof as the ed25519 signature.
+    /// Returns empty if proof is shorter than 64 bytes.
+    fun extract_signature(proof: &vector<u8>): vector<u8> {
+        let mut sig = vector::empty<u8>();
+        if (vector::length(proof) < 64) { return sig };
+        let mut i: u64 = 0;
+        while (i < 64) {
+            vector::push_back(&mut sig, *vector::borrow(proof, i));
+            i = i + 1;
+        };
+        sig
+    }
+
+    /// Verify proof against the configured prover. If no pubkey is set,
+    /// falls back to the legacy "proof must be non-empty" check.
+    ///
+    /// **STARK-only strict mode**: when `is_stark_only_mode(state)` is
+    /// true, this function returns false unconditionally so the entire
+    /// ed25519 fast path is disabled. Post-quantum deployments must
+    /// enable strict mode via `admin_set_stark_only_mode(admin, state, true)`
+    /// and route every verify through `verify_hedge_stark_proof_entry`.
+    fun verify_with_prover(state: &ZKVerifierState, proof: &vector<u8>, msg: &vector<u8>): bool {
+        if (is_stark_only_mode(state)) {
+            // Quantum-vulnerable path is disabled by policy — force
+            // callers onto the STARK verify entry.
+            return false
+        };
+        if (!df::exists_(&state.id, PROVER_PUBKEY_KEY)) {
+            // INSECURE MODE — legacy length check. Operator should set
+            // a prover pubkey before relying on the ZK gate.
+            return vector::length(proof) > 0
+        };
+        if (vector::length(proof) < 64) { return false };
+        let pubkey: &vector<u8> = df::borrow(&state.id, PROVER_PUBKEY_KEY);
+        let sig = extract_signature(proof);
+        ed25519::ed25519_verify(&sig, pubkey, msg)
+    }
+
     // ============ Verification Functions ============
 
     /// Verify a ZK proof
@@ -184,20 +314,39 @@ module zkvanguard::zk_verifier {
 
         let verifier = tx_context::sender(ctx);
         let current_time = clock::timestamp_ms(clock);
-        
-        // Generate proof hash from proof data
-        let proof_hash = hash::keccak256(&proof_data);
-        
+
+        // Real verification (or fallback if no pubkey set). Message =
+        // commitment_hash so the prover commits to the specific
+        // commitment being verified.
+        assert!(verify_with_prover(state, &proof_data, &commitment_hash), E_INVALID_PROOF);
+
+        // AUDIT 2026-06-04 phase 4: dedup by SIGNATURE bytes, not by
+        // keccak(proof_data). The signature is over commitment_hash;
+        // an attacker who has any valid signature could otherwise
+        // append arbitrary bytes to proof_data to mint unlimited
+        // distinct keccak hashes while keeping the signature valid —
+        // bypassing replay protection. Using the deterministic 64-byte
+        // ed25519 signature as the dedup key closes that gap. When in
+        // legacy length-check mode (no prover configured) the dedup
+        // key is just the full proof_data hash, matching old behavior.
+        let dedup_key = if (has_prover_pubkey(state)) {
+            extract_signature(&proof_data)
+        } else {
+            hash::keccak256(&proof_data)
+        };
+
         // Check if proof already used (prevent replay attacks)
-        assert!(!table::contains(&state.used_proofs, proof_hash), E_PROOF_ALREADY_USED);
+        assert!(!table::contains(&state.used_proofs, dedup_key), E_PROOF_ALREADY_USED);
 
         // Mark proof as used
-        table::add(&mut state.used_proofs, proof_hash, true);
+        table::add(&mut state.used_proofs, dedup_key, true);
 
         // Increment counter
         state.total_proofs_verified = state.total_proofs_verified + 1;
 
-        // Create proof record
+        // Create proof record (keep keccak hash in the record so off-chain
+        // indexers can still verify the proof_data ↔ record link).
+        let proof_hash = hash::keccak256(&proof_data);
         let proof_record = ProofRecord {
             id: object::new(ctx),
             proof_hash,
@@ -283,6 +432,11 @@ module zkvanguard::zk_verifier {
         // In production, add proper ZK proof verification here
         assert!(vector::length(&proof_hash) > 0, E_INVALID_PROOF);
 
+        // Real verification: prover signs the commitment_hash so
+        // execution is gated by a fresh attestation, not just possession
+        // of a VerifierCap.
+        assert!(verify_with_prover(state, &proof_data, &commitment.commitment_hash), E_INVALID_PROOF);
+
         commitment.executed = true;
         commitment.executed_at = option::some(current_time);
 
@@ -309,14 +463,21 @@ module zkvanguard::zk_verifier {
 
         let verifier = tx_context::sender(ctx);
         let current_time = clock::timestamp_ms(clock);
-        
-        let proof_hash = hash::keccak256(&proof_data);
-        
-        assert!(!table::contains(&state.used_proofs, proof_hash), E_PROOF_ALREADY_USED);
 
-        table::add(&mut state.used_proofs, proof_hash, true);
+        assert!(verify_with_prover(state, &proof_data, &commitment_hash), E_INVALID_PROOF);
+
+        // AUDIT 2026-06-04 phase 4: dedup by signature, not full proof
+        // hash — see verify_proof above for the rationale.
+        let dedup_key = if (has_prover_pubkey(state)) {
+            extract_signature(&proof_data)
+        } else {
+            hash::keccak256(&proof_data)
+        };
+        assert!(!table::contains(&state.used_proofs, dedup_key), E_PROOF_ALREADY_USED);
+        table::add(&mut state.used_proofs, dedup_key, true);
         state.total_proofs_verified = state.total_proofs_verified + 1;
 
+        let proof_hash = hash::keccak256(&proof_data);
         let proof_record = ProofRecord {
             id: object::new(ctx),
             proof_hash,
@@ -364,6 +525,171 @@ module zkvanguard::zk_verifier {
     /// Get proof record info
     public fun get_proof_info(record: &ProofRecord): (vector<u8>, address, u64) {
         (record.proof_hash, record.verifier, record.verified_at)
+    }
+
+    // ============ STARK path (Phase A.5 wire-in) ============
+    //
+    // Chain-side hedge STARK verification without trusting the operator's
+    // ed25519 key. Delegates to `zkv_stark::verify_hedge_stark_proof` for
+    // the full protocol check (grinding + FRI + composition) then applies
+    // the same replay-protection + event-emission pattern the ed25519
+    // path uses. `commitment_hash` is the replay key — a depositor can't
+    // resubmit the same commitment twice regardless of proof shape.
+    //
+    // Non-entry: Move entry functions can't take custom structs, so
+    // FriQuery / TraceOpening / MerkleProofStep args mean this is
+    // callable from other Move modules only. Direct-PTB entry needs a
+    // BCS byte-decoder — deferred, tracked in docs/ZK_ROADMAP.md.
+
+    /// Verify a hedge STARK proof end-to-end + mint a ProofRecord.
+    /// Aborts on replay (E_PROOF_ALREADY_USED) or proof failure
+    /// (E_INVALID_PROOF). Emits ProofVerified on success and transfers
+    /// the ProofRecord to the sender.
+    public fun verify_hedge_stark_proof_pub(
+        state: &mut ZKVerifierState,
+        trace_merkle_root: vector<u8>,
+        fri_roots: vector<vector<u8>>,
+        final_poly_coeffs: vector<u64>,
+        fri_queries: vector<zkvanguard::zkv_fri::FriQuery>,
+        trace_openings: vector<zkvanguard::zkv_hedge_air::TraceOpening>,
+        extended_size: u64,
+        trace_length: u64,
+        leverage_cap: u64,
+        grinding_nonce: u64,
+        grinding_bits: u64,
+        max_final_degree: u64,
+        commitment_hash: vector<u8>,
+        clock: &Clock,
+        ctx: &mut TxContext,
+    ) {
+        assert!(!state.paused, E_PAUSED);
+
+        // Replay protection is BY COMMITMENT for the STARK path — a
+        // depositor commits once; any subsequent proof over the same
+        // commitment is rejected regardless of its byte shape.
+        assert!(
+            !table::contains(&state.used_proofs, commitment_hash),
+            E_PROOF_ALREADY_USED,
+        );
+
+        // Delegate the full protocol check to zkv_stark. Passes borrow
+        // of trace_merkle_root; consumes the other vectors.
+        let ok = zkvanguard::zkv_stark::verify_hedge_stark_proof(
+            &trace_merkle_root,
+            fri_roots,
+            final_poly_coeffs,
+            fri_queries,
+            trace_openings,
+            extended_size,
+            trace_length,
+            leverage_cap,
+            grinding_nonce,
+            grinding_bits,
+            max_final_degree,
+        );
+        assert!(ok, E_INVALID_PROOF);
+
+        // Commit to replay-protection set + counter bump.
+        table::add(&mut state.used_proofs, commitment_hash, true);
+        state.total_proofs_verified = state.total_proofs_verified + 1;
+
+        let verifier = tx_context::sender(ctx);
+        let current_time = clock::timestamp_ms(clock);
+        // proof_hash for the record: keccak of the commitment (the
+        // canonical anchor; STARK proof bytes may be huge).
+        let proof_hash = hash::keccak256(&commitment_hash);
+        let proof_type = std::string::utf8(b"hedge-stark");
+        let metadata = std::string::utf8(b"zkv_stark::verify_hedge_stark_proof");
+
+        event::emit(ProofVerified {
+            proof_hash,
+            commitment_hash,
+            verifier,
+            proof_type,
+            timestamp: current_time,
+        });
+
+        let proof_record = ProofRecord {
+            id: object::new(ctx),
+            proof_hash,
+            commitment_hash,
+            verifier,
+            verified_at: current_time,
+            portfolio_id: option::none(),
+            proof_type,
+            metadata,
+        };
+        transfer::transfer(proof_record, verifier);
+    }
+
+    /// PTB-callable entry point for STARK hedge verify.
+    ///
+    /// Same protocol check as `verify_hedge_stark_proof_pub`, but accepts
+    /// the deeply-nested query/opening data as BCS-encoded blobs so it
+    /// can be called directly from a Sui transaction (Move entry
+    /// functions can't take `vector<FriQuery>` etc. as-is).
+    ///
+    /// Caller responsibility (TS SDK side, using `@mysten/bcs`):
+    ///   - `fri_queries_bcs` = BCS(vector<FriQuery>)  where FriQuery is
+    ///     { index: u64, layers: vector<FriQueryLayer> } and each layer
+    ///     is { value: u64, sibling_value: u64,
+    ///          merkle_proof: vector<{ sibling: vector<u8>, is_left: bool }>,
+    ///          sibling_proof: vector<{ sibling: vector<u8>, is_left: bool }> }
+    ///   - `trace_openings_bcs` = BCS(vector<TraceOpening>)  where
+    ///     TraceOpening is { index: u64, value: u64,
+    ///                       merkle_proof: vector<{ sibling: vector<u8>, is_left: bool }> }
+    ///
+    /// Everything else stays as native tx-arg types (primitives + shallow
+    /// vectors), so the TS caller only needs BCS for the two nested pieces.
+    public entry fun verify_hedge_stark_proof_entry(
+        state: &mut ZKVerifierState,
+        trace_merkle_root: vector<u8>,
+        fri_roots: vector<vector<u8>>,
+        final_poly_coeffs: vector<u64>,
+        fri_queries_bcs: vector<u8>,
+        trace_openings_bcs: vector<u8>,
+        extended_size: u64,
+        trace_length: u64,
+        leverage_cap: u64,
+        grinding_nonce: u64,
+        grinding_bits: u64,
+        max_final_degree: u64,
+        commitment_hash: vector<u8>,
+        clock: &Clock,
+        ctx: &mut TxContext,
+    ) {
+        let fri_queries = zkvanguard::zkv_stark::decode_fri_queries(fri_queries_bcs);
+        let trace_openings = zkvanguard::zkv_stark::decode_trace_openings(trace_openings_bcs);
+        verify_hedge_stark_proof_pub(
+            state,
+            trace_merkle_root,
+            fri_roots,
+            final_poly_coeffs,
+            fri_queries,
+            trace_openings,
+            extended_size,
+            trace_length,
+            leverage_cap,
+            grinding_nonce,
+            grinding_bits,
+            max_final_degree,
+            commitment_hash,
+            clock,
+            ctx,
+        );
+    }
+
+    // ============ Test helpers for STARK path ============
+
+    /// Pre-populate `used_proofs` with a commitment hash so replay-
+    /// protection tests don't need to construct a full valid STARK
+    /// proof first. Test-only; NOT callable in production.
+    #[test_only]
+    public fun mark_commitment_used_for_testing(
+        state: &mut ZKVerifierState,
+        commitment_hash: vector<u8>,
+    ) {
+        table::add(&mut state.used_proofs, commitment_hash, true);
     }
 
     // ============ Test Functions ============
